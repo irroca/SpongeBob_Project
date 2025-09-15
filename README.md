@@ -47,8 +47,8 @@ spongebob-llm/
 
 ```bash
 # 克隆项目
-git clone <your-repo-url>
-cd spongebob-llm
+git clone https://github.com/irroca/SpongeBob_Project.git
+cd SpongeBob_Project
 
 # 安装依赖（请根据你的CUDA版本安装PyTorch）
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
