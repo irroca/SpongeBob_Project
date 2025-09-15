@@ -1,4 +1,2 @@
-sample_pth/
-spongebob_tokenizer/
-.msc
 .gitignore
+sample_pth/
