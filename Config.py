@@ -16,6 +16,7 @@ class LLMConfig(PretrainedConfig):
                   rope_theta: int=1e6,
                   dropout: float=0.0,
                   ):
+          super().__init__()
           self.dim = dim
           self.n_layers=n_layers
           self.n_heads=n_heads
@@ -27,4 +28,12 @@ class LLMConfig(PretrainedConfig):
           self.max_seq_len=max_seq_len
           self.rope_theta=rope_theta
           self.dropout=dropout
-          self._attn_implementation_internal = None  # 或者 "auto"
+          self._attn_implementation_internal = None
+          # 添加配置验证
+          self._validate_config()
+     
+     def _validate_config(self):
+         """验证配置参数的有效性"""
+         assert self.n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
+         assert self.dim % self.n_heads == 0, "dim must be divisible by n_heads"
+         assert self.max_seq_len > 0, "max_seq_len must be positive"

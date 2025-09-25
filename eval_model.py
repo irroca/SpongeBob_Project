@@ -32,7 +32,7 @@ def init_model(args):
 
 def main():
      parser=argparse.ArgumentParser()
-     parser.add_argument('--save_dir', default='results', type=str)
+     parser.add_argument('--save_dir', default='sample_pth', type=str)
      parser.add_argument('--temperature', default=0.7, type=float)
      parser.add_argument('--top_p', default=0.8, type=float)
      parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str)
@@ -56,7 +56,7 @@ def main():
             tokenize=False,
             add_generation_prompt=True
           )[-args.max_seq_len + 1:] if args.model_mode != 0 else (tokenizer.bos_token + prompt)
-          # print('new_prompt:', new_prompt)
+          print('new_prompt:', new_prompt)
           
           with torch.no_grad():
                x = torch.tensor(tokenizer(new_prompt)['input_ids'], device=args.device).unsqueeze(0)

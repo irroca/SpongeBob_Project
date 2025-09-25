@@ -11,169 +11,263 @@ from model import SpongeBob
 from Config import LLMConfig
 from dataset import PretrainDataset
 
-# 获取学习率，根据当前步数和总步数动态调整
 def get_lr(current_step, total_steps, lr):
-    return lr / 10 + 0.5 * lr * (1 + math.cos(math.pi * current_step / total_steps))
+    """学习率调度函数"""
+    if current_step < total_steps * 0.1:  # 前10%步数使用线性warmup
+        return lr * (current_step / (total_steps * 0.1))
+    return lr * 0.1 + 0.5 * lr * (1 + math.cos(math.pi * (current_step - total_steps * 0.1) / (total_steps * 0.9)))
 
-# 训练一个epoch
-def train_epoch(epoch, wandb):
-     loss_fct = nn.CrossEntropyLoss(reduction='none')  # 定义损失函数，使用交叉熵损失
+def save_checkpoint(model, optimizer, scaler, epoch, step, global_step, loss, config, save_path):
+    """保存完整的训练状态"""
+    checkpoint = {
+        'epoch': epoch,
+        'step': step,
+        'global_step': global_step,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scaler_state_dict': scaler.state_dict() if scaler else None,
+        'loss': loss,
+        'config': config.__dict__,
+        'timestamp': time.time()
+    }
+    
+    # 确保目录存在
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    torch.save(checkpoint, save_path)
+    print(f"Checkpoint saved to {save_path}")
 
-     start_time = time.time()  # 记录训练开始时间
+def load_checkpoint(checkpoint_path, model, optimizer, scaler, device):
+    """加载训练状态"""
+    if not os.path.exists(checkpoint_path):
+        print(f"Checkpoint {checkpoint_path} not found, starting from scratch")
+        return 0, 0, 0, float('inf')
+    
+    print(f"Loading checkpoint from {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # 加载模型状态
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print("Model state loaded")
+    
+    # 加载优化器状态
+    if 'optimizer_state_dict' in checkpoint and optimizer is not None:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        print("Optimizer state loaded")
+    
+    # 加载梯度缩放器状态
+    if 'scaler_state_dict' in checkpoint and scaler is not None and checkpoint['scaler_state_dict'] is not None:
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        print("Scaler state loaded")
+    
+    # 返回训练状态
+    epoch = checkpoint.get('epoch', 0)
+    step = checkpoint.get('step', 0)
+    global_step = checkpoint.get('global_step', 0)
+    loss = checkpoint.get('loss', float('inf'))
+    
+    print(f"Resumed from checkpoint: epoch {epoch}, step {step}, global_step {global_step}, loss {loss:.4f}")
+    return epoch, step, global_step, loss
 
-     # 遍历训练数据集
-     for step, (X, Y, loss_mask) in enumerate(train_loader):
-          X = X.to(args.device)  # 将输入数据移动到设备上（GPU/CPU）
-          Y = Y.to(args.device)  # 将标签数据移动到设备上
-          loss_mask = loss_mask.to(args.device)  # 将损失mask数据移动到设备上
-
-          # 计算当前学习率
-          lr = get_lr(epoch * iter_per_epoch + step, args.epochs * iter_per_epoch, args.learning_rate)
-          # 更新优化器的学习率
-          for param_group in optimizer.param_groups:
-               param_group['lr'] = lr
-
-          # 在上下文管理器中进行前向传播和反向传播
-          with ctx:
-               res = model(X)  # 模型的前向传播
-               loss = loss_fct(
-                    res.logits.view(-1, res.logits.size(-1)),  # 计算损失
-                    Y.view(-1)
-               ).view(Y.size())
-               loss = (loss * loss_mask).sum() / loss_mask.sum()  # 应用mask并计算平均损失
-               loss = loss / args.accumulation_steps  # 进行梯度累积
-
-          # 执行反向传播
-          scaler.scale(loss).backward()
-          # 每累积一定步数后进行优化器更新
-          if (step + 1) % args.accumulation_steps == 0:
-               scaler.unscale_(optimizer)  # 解除梯度缩放
-               torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)  # 梯度裁剪
-
-               scaler.step(optimizer)  # 执行优化步骤
-               scaler.update()  # 更新缩放器
-               optimizer.zero_grad(set_to_none=True)  # 清空梯度
-
-          # 每隔一定步数记录一次日志
-          if step % args.log_step == 0:
-               spend_time = time.time() - start_time  # 计算当前的时间
-               print(
-                    'Epoch:[{}/{}]({}/{}) loss:{:.3f} lr:{:.12f} epoch_Time:{}min:'.format(
-                         epoch + 1,  # 当前epoch
-                         args.epochs,  # 总的epoch数
-                         step,  # 当前步数
-                         iter_per_epoch,  # 每个epoch的迭代次数
-                         loss.item() * args.accumulation_steps,  # 损失值，乘以累积步数
-                         optimizer.param_groups[-1]['lr'],  # 当前学习率
-                         spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60  # 估计剩余时间
-                         )
-               )
-               if (wandb is not None):
-                    wandb.log({"loss": loss.item() * args.accumulation_steps,
-                               "lr": optimizer.param_groups[-1]['lr'],
-                               "epoch_Time": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60})
-
-          # 每隔一定步数保存模型
-          if (step + 1) % args.save_step == 0:
-               model.eval()  # 设置模型为评估模式
-               ckp = f'{args.save_dir}/pretrain_step{step}.pth'  # 保存模型的路径
-
-               state_dict = model.state_dict()
-
-               torch.save(state_dict, ckp)  # 保存模型
-               model.train()  # 恢复为训练模式
-
-
-# 初始化模型和分词器
-def init_model(llm_config):
-     tokenizer = AutoTokenizer.from_pretrained('./spongebob_tokenizer')  # 加载分词器
-     model = SpongeBob(llm_config).to(args.device)  # 初始化模型并移动到设备
-     print(f'LLM总参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')  # 打印模型参数量
-     return model, tokenizer
-
-
-if __name__=='__main__':
-     # 创建命令行参数解析器
-     parser = argparse.ArgumentParser()
-
-     # 添加各类参数，用于配置训练过程
-     parser.add_argument("--save_dir", type=str, default="results")  # 保存结果的目录
-     parser.add_argument("--epochs", type=int, default=1)  # 训练的轮数
-     parser.add_argument("--batch_size", type=int, default=80)  # 每批次的样本数量
-     parser.add_argument("--learning_rate", type=float, default=5e-4)  # 学习率
-     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")  # 设备类型，支持cuda或cpu
-     parser.add_argument("--use_wandb", type=bool,default=True)  # 是否使用wandb进行日志记录
-     parser.add_argument("--dtype", type=str, default="bfloat16")  # 数据类型，默认使用bfloat16
-     parser.add_argument("--wandb_project", type=str, default="SpongeBob-Pretrain")  # wandb项目名称
-     parser.add_argument("--num_workers", type=int, default=1)  # 数据加载时的工作线程数
-     parser.add_argument("--accumulation_steps", type=int, default=2)  # 梯度累积步数
-     parser.add_argument("--grad_clip", type=float, default=1.0)  # 梯度裁剪阈值
-     parser.add_argument("--warmup_iters", type=int, default=0)  # 学习率预热的迭代次数
-     parser.add_argument("--log_step", type=int, default=10)  # 每多少步记录一次日志
-     parser.add_argument("--save_step", type=int, default=1000)  # 每多少步保存一次模型
-     parser.add_argument('--max_seq_len', default=512, type=int)  # 输入的最大序列长度
-     parser.add_argument("--data_path", type=str, default="pretrain.jsonl")  # 训练数据的路径
+def train_epoch(epoch, start_step, global_step, model, optimizer, scaler, train_loader, args, ctx, wandb):
+    """训练一个epoch"""
+    loss_fct = nn.CrossEntropyLoss(reduction='none')
+    start_time = time.time()
+    total_batches = len(train_loader)
      
-     # 解析命令行参数
-     args = parser.parse_args()
+    # 从指定步骤开始训练
+    for step, (X, Y, loss_mask) in enumerate(train_loader):
+        if step < start_step:
+            if step % 100 == 0:  # 每100步打印一次跳过的信息
+                print(f"Skipping step {step}/{start_step}")
+            continue
+               
+        X = X.to(args.device,non_blocking=True)
+        Y = Y.to(args.device,non_blocking=True)
+        loss_mask = loss_mask.to(args.device,non_blocking=True)
 
-     # 配置语言模型的参数
-     lm_config = LLMConfig(max_seq_len=args.max_seq_len)
-     
-     # 创建保存目录
-     args.save_dir = os.path.join(args.save_dir)
-     os.makedirs(args.save_dir, exist_ok=True)
+        lr = get_lr(global_step, args.total_steps, args.learning_rate)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
 
-     # 每次迭代处理的token数量
-     tokens_per_iter = args.batch_size * lm_config.max_seq_len
+        with ctx:
+            res = model(X)
+            loss = loss_fct(
+                res.logits.view(-1, res.logits.size(-1)),
+                Y.view(-1)
+            ).view(Y.size())
+            loss = (loss * loss_mask).sum() / loss_mask.sum()
+            loss = loss / args.accumulation_steps
 
-     # 设置随机种子，保证训练可复现
-     torch.manual_seed(1337)
+        scaler.scale(loss).backward()
+          
+        if (step + 1) % args.accumulation_steps == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+               
+        global_step += 1
+          
+        if step % args.log_step == 0:
+            spend_time = time.time() - start_time
+            current_loss = loss.item() * args.accumulation_steps
+            batches_per_sec = (step + 1 - start_step) / spend_time if spend_time > 0 else 0
+            eta_minutes = (total_batches - step) / batches_per_sec / 60 if batches_per_sec > 0 else 0
+            print(
+            'Epoch:[{}/{}]({}/{}) loss:{:.3f} lr:{:.7f} global_step:{} ETA:{:.1f}min'.format(
+                epoch + 1,
+                args.epochs,
+                step,
+                total_batches,
+                current_loss,
+                optimizer.param_groups[-1]['lr'],
+                global_step,
+                eta_minutes
+                )
+            )
+               
+        if wandb is not None:
+            wandb.log({
+                "loss": current_loss,
+                "lr": optimizer.param_groups[-1]['lr'],
+                "global_step": global_step,
+                "epoch": epoch
+            })
 
-     # 判断设备类型（cuda或cpu）
-     device_type = "cuda" if "cuda" in args.device else "cpu"
+        # 定期保存checkpoint
+        if global_step % args.save_step == 0:
+            checkpoint_path = f'{args.save_dir}/checkpoint_epoch_{epoch}_step_{global_step}.pth'
+            save_checkpoint(
+                model, optimizer, scaler, epoch, step, global_step, 
+                current_loss, args.lm_config, checkpoint_path
+            )
+            
+            # 同时保存最新checkpoint
+            latest_path = f'{args.save_dir}/latest_checkpoint.pth'
+            save_checkpoint(
+                model, optimizer, scaler, epoch, step, global_step,
+                current_loss, args.lm_config, latest_path
+            )
 
-     # 设置wandb运行名称
-     args.wandb_run_name = f"SponseBob-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
-     
-     # 根据设备类型选择自动混合精度（AMP）或不使用AMP
-     ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast()
+        # 保存最终模型
+        if args.save_final_model and (epoch == args.epochs - 1 and step == len(train_loader) - 1):
+            model_path = f'{args.save_dir}/pretrain_final.pth'
+            torch.save(model.state_dict(), model_path)
+            print(f"Final model saved to {model_path}")
 
-     # 如果使用wandb进行实验跟踪
-     if args.use_wandb:
-          import wandb
+    return global_step
 
-          # 初始化wandb项目
-          wandb.init(project=args.wandb_project, name=args.wandb_run_name)
-     else:
-          wandb = None  # 如果不使用wandb，设置为None
-     
-     # 初始化模型和分词器
-     model, tokenizer = init_model(lm_config)
+def init_model_and_optimizer(args, checkpoint_path=None):
+    """初始化模型和优化器，可选择从checkpoint恢复"""
+    tokenizer = AutoTokenizer.from_pretrained('./spongebob_tokenizer')
+    model = SpongeBob(args.lm_config).to(args.device)
+    
+    # 初始化优化器和缩放器
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+    scaler = torch.amp.GradScaler('cuda',enabled=(args.dtype in ['float16', 'bfloat16']))
+    
+    # 训练状态变量
+    start_epoch = 0
+    start_step = 0
+    global_step = 0
+    best_loss = float('inf')
+    
+    # 从checkpoint恢复
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        start_epoch, start_step, global_step, best_loss = load_checkpoint(
+            checkpoint_path, model, optimizer, scaler, args.device
+        )
+    
+    print(f'LLM parameters size:{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} Million')
+    return model, tokenizer, optimizer, scaler, start_epoch, start_step, global_step, best_loss
 
-     # 加载训练数据集
-     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=lm_config.max_seq_len)
+def main():
+    """主训练函数"""
+    parser = argparse.ArgumentParser()
 
-     # 创建数据加载器
-     train_loader = DataLoader(
+    parser.add_argument("--save_dir", type=str, default="results")
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=80)
+    parser.add_argument("--learning_rate", type=float, default=5e-4)
+    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--use_wandb", type=bool, default=False)
+    parser.add_argument("--dtype", type=str, default="bfloat16")
+    parser.add_argument("--wandb_project", type=str, default="SpongeBob-Pretrain")
+    parser.add_argument("--num_workers", type=int, default=1)
+    parser.add_argument("--accumulation_steps", type=int, default=2)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--log_step", type=int, default=10)
+    parser.add_argument("--save_step", type=int, default=1000)
+    parser.add_argument('--max_seq_len', default=512, type=int)
+    parser.add_argument("--data_path", type=str, default="datasets/pretrain.jsonl")
+    parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--save_final_model", type=bool, default=True, help="Save final model separately")
+    
+    args = parser.parse_args()
+
+    args.lm_config = LLMConfig(max_seq_len=args.max_seq_len)
+    args.save_dir = os.path.join(args.save_dir)
+    os.makedirs(args.save_dir, exist_ok=True)
+
+    torch.manual_seed(1337)
+    device_type = "cuda" if "cuda" in args.device else "cpu"
+
+    args.wandb_run_name = f"SponseBob-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+    
+    ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast('cuda')
+
+    if args.use_wandb:
+        import swanlab as wandb 
+        wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=args)
+    else:
+        wandb = None
+    
+    # 初始化模型和优化器（可能从checkpoint恢复）
+    model, tokenizer, optimizer, scaler, start_epoch, start_step, global_step, best_loss = init_model_and_optimizer(
+    args, args.resume_from
+    )
+
+    train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.lm_config.max_seq_len)
+    train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        pin_memory=True,  # 是否将数据复制到CUDA内存
-        drop_last=False,  # 不丢弃最后一批数据
-        shuffle=False,  # 不对数据进行乱序
-        num_workers=args.num_workers,  # 数据加载时使用的子线程数
-     )
+        pin_memory=True,
+        drop_last=False,
+        shuffle=True,
+        num_workers=args.num_workers,
+    )
 
-     # 初始化梯度缩放器（用于混合精度训练）
-     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype in ['float16', 'bfloat16']))
+    # 计算总步数（用于学习率调度）
+    batches_per_epoch = len(train_loader)
+    args.total_steps = args.epochs * batches_per_epoch // args.accumulation_steps
+    print(f"Total batches per epoch: {batches_per_epoch}")
+    print(f"Total training steps: {args.total_steps}")
+    print(f"Starting from epoch {start_epoch}, step {start_step}, global_step {global_step}")
+    
+    # 训练循环
+    for epoch in range(start_epoch, args.epochs):
+        print(f"\n=== Starting Epoch {epoch + 1}/{args.epochs} ===")
+    
+        global_step = train_epoch(
+            epoch, start_step, global_step, model, optimizer, scaler, 
+            train_loader, args, ctx, wandb
+        )
+    
+        # 重置start_step，下一epoch从0开始
+        start_step = 0
+        
+        # 每个epoch结束后保存checkpoint
+        epoch_checkpoint_path = f'{args.save_dir}/epoch_{epoch+1}_checkpoint.pth'
+        save_checkpoint(
+            model, optimizer, scaler, epoch + 1, 0, global_step,
+            best_loss, args.lm_config, epoch_checkpoint_path
+        )
+        
+        print(f"=== Finished Epoch {epoch + 1}/{args.epochs} ===\n")
+    print("Training completed!")
 
-     # 设置优化器
-     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
 
-     # 计算每个epoch中的迭代次数
-     iter_per_epoch = len(train_loader)
-
-     # 开始训练
-     for epoch in range(args.epochs):
-        # 调用训练函数开始训练每个epoch
-        train_epoch(epoch, wandb)
+if __name__ == '__main__':
+    main()

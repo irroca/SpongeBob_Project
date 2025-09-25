@@ -202,25 +202,36 @@ class SpongeBob(PreTrainedModel):
           self.tok_embeddings.weight = self.output.weight
           # 预先计算位置编码，存储为buffer，不参与训练
           self.register_buffer("pos_cis",
-                             precompute_pos_cis(dim=params.dim // params.n_heads, theta=params.rope_theta),
+                             precompute_pos_cis(dim=params.dim // params.n_heads, end=params.max_seq_len, theta=params.rope_theta),
                              persistent=False)
-          self.OUT = CausalLMOutputWithPast()
 
      def forward(self,
                  input_ids: Optional[torch.Tensor] = None,
                  past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
                  use_cache: bool = False,
-                 **args
+                 **kwargs
                  ):
           # 如果没有传入KV缓存，则置为None列表
           past_key_values = past_key_values or [None] * len(self.layers)
-          #
-          start_pos = args.get('start_pos', 0)
-          #
+          
+          # 获取起始位置，默认为0
+          start_pos = kwargs.get('start_pos', 0)
+          
           # 词嵌入 + dropout
           h = self.dropout(self.tok_embeddings(input_ids))
+          
           # 根据输入序列长度获取对应位置编码
-          pos_cis = self.pos_cis[start_pos:start_pos + input_ids.size(1)]
+          seq_len = input_ids.size(1)
+          # 检查位置编码是否足够，如果不够则动态扩展
+          if start_pos + seq_len > self.pos_cis.shape[0]:
+              # 动态扩展位置编码（简单实现，实际可能需要更复杂的逻辑）
+              required_len = start_pos + seq_len
+              current_len = self.pos_cis.shape[0]
+              if required_len > current_len:
+                  # 这里可以扩展位置编码，但为了简单起见，我们限制长度
+                  seq_len = min(seq_len, self.pos_cis.shape[0] - start_pos)
+          
+          pos_cis = self.pos_cis[start_pos:start_pos + seq_len]
           past_kvs = []
 
           # 逐层传递数据，并收集KV缓存（如果需要）
@@ -231,55 +242,100 @@ class SpongeBob(PreTrainedModel):
                     use_cache=use_cache
                )
                past_kvs.append(past_kv)
+          
           # 最后经过归一化和输出线性层得到logits
           logits = self.output(self.norm(h))
-          self.OUT.__setitem__('logits', logits)
-          self.OUT.__setitem__('past_key_values', past_kvs)
-
-          return self.OUT
+          
+          # 正确创建输出对象
+          return CausalLMOutputWithPast(
+              logits=logits,
+              past_key_values=past_kvs
+          )
      
      @torch.inference_mode()
      # 生成函数：支持流式生成与一次性生成
      def generate(self, input_ids, eos_token_id=2, max_new_tokens=1024, temperature=0.75, top_p=0.90,
-                 stream=False, rp=1., use_cache=True, pad_token_id=0, **args):
-            
-            
-          return self._stream(input_ids, eos_token_id, max_new_tokens, temperature, top_p, rp, use_cache, **args)
-
-            
+                 stream=False, repetition_penalty=1., use_cache=True, pad_token_id=0, **kwargs):
+          if stream:
+              return self._stream_generate(input_ids, eos_token_id, max_new_tokens, temperature, top_p, 
+                                         repetition_penalty, use_cache, **kwargs)
+          else:
+              # 一次性生成所有token
+              result = []
+              for token in self._stream_generate(input_ids, eos_token_id, max_new_tokens, temperature, top_p,
+                                               repetition_penalty, use_cache, **kwargs):
+                  result.append(token)
+              return result[-1] if result else input_ids
+     
      # 内部流式生成函数
-     def _stream(self, input_ids, eos_token_id, max_new_tokens, temperature, top_p, rp, use_cache, **args):
-            start, first_seq, past_kvs = input_ids.shape[1], True, None
-            while input_ids.shape[1] < max_new_tokens - 1:
-                # 首次调用或未使用缓存时，传入整个序列
-                if first_seq or not use_cache:
-                    out, first_seq = self(input_ids, past_key_values=past_kvs, use_cache=use_cache, **args), False
-                else:
-                    # 仅传入最后一个token，同时更新start_pos
-                    out = self(input_ids[:, -1:], past_key_values=past_kvs, use_cache=use_cache,
-                            start_pos=input_ids.shape[1] - 1, **args)
-                # 取出最后一步的logits及更新后的KV缓存
-                logits, past_kvs = out.logits[:, -1, :], out.past_key_values
-                # 对已经生成的token进行惩罚，防止重复生成
-                logits[:, list(set(input_ids.tolist()[0]))] /= rp
-                # 温度缩放
-                logits /= (temperature + 1e-9)
+     def _stream_generate(self, input_ids, eos_token_id, max_new_tokens, temperature, top_p, 
+                         repetition_penalty, use_cache, **kwargs):
+        start_len = input_ids.shape[1]
+        total_len = start_len
+        past_key_values = None
+        first_seq = True
+        
+        # 修正循环条件：生成不超过max_new_tokens个新token
+        for _ in range(max_new_tokens):
+            # 首次调用或未使用缓存时，传入整个序列
+            if first_seq or not use_cache:
+                out = self(input_ids, past_key_values=past_key_values, use_cache=use_cache, **kwargs)
+                first_seq = False
+            else:
+                # 仅传入最后一个token，同时更新start_pos
+                out = self(input_ids[:, -1:], past_key_values=past_key_values, use_cache=use_cache,
+                          start_pos=total_len-1, **kwargs)
+            
+            # 取出最后一步的logits及更新后的KV缓存
+            logits = out.logits[:, -1, :]
+            past_key_values = out.past_key_values
+            
+            # 重复惩罚：对已经生成的token进行惩罚，防止重复生成
+            if repetition_penalty != 1.0:
+                for batch_idx in range(input_ids.shape[0]):
+                    # 对每个batch单独处理
+                    generated_tokens = input_ids[batch_idx].tolist()
+                    # 使用有序集合保持顺序
+                    unique_tokens = []
+                    seen = set()
+                    for token in generated_tokens:
+                        if token not in seen:
+                            unique_tokens.append(token)
+                            seen.add(token)
+                    logits[batch_idx, unique_tokens] /= repetition_penalty
+            
+            # 温度缩放
+            if temperature > 0:
+                logits = logits / temperature
                 # 如果设置了top_p采样，则进行核采样处理
                 if top_p is not None and top_p < 1.0:
                     sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
                     sorted_probs = F.softmax(sorted_logits, dim=-1)
                     cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                    
+                    # 移除累积概率超过top_p的token
                     sorted_indices_to_remove = cumulative_probs > top_p
+                    # 保留第一个超过阈值的token
                     sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
                     sorted_indices_to_remove[:, 0] = False
+                    
                     indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
                     logits[indices_to_remove] = -float('Inf')
+                
                 # 根据采样后的概率分布选取下一个token
-                input_ids_next = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
-                # 将新token拼接到已有序列上
-                input_ids = torch.cat((input_ids, input_ids_next), dim=1)
-                # 生成器返回新生成部分
-                yield input_ids[:, start:]
-                # 若生成的token为结束符，则停止生成
-                if input_ids_next.item() == eos_token_id:
-                    break
+                probs = F.softmax(logits, dim=-1)
+                input_ids_next = torch.multinomial(probs, num_samples=1)
+            else:
+                # 贪婪解码
+                input_ids_next = torch.argmax(logits, dim=-1, keepdim=True)
+            
+            # 将新token拼接到已有序列上
+            input_ids = torch.cat((input_ids, input_ids_next), dim=1)
+            total_len += 1
+            
+            # 生成器返回新生成部分
+            yield input_ids[:, start_len:]
+            
+            # 若生成的token为结束符，则停止生成
+            if input_ids_next.item() == eos_token_id:
+                break

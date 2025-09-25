@@ -59,9 +59,9 @@ class PretrainDataset(Dataset):
         loss_mask = (input_ids != self.tokenizer.pad_token_id)
 
         # X 为输入序列（去掉最后一个 token），Y 为目标序列（去掉第一个 token）
-        X = torch.tensor(input_ids[:-1], dtype=torch.long)
-        Y = torch.tensor(input_ids[1:], dtype=torch.long)
-        loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)
+        X = input_ids[:-1].clone().detach().long()
+        Y = input_ids[1:].clone().detach().long()
+        loss_mask = loss_mask[1:].clone().detach().long()
         return X, Y, loss_mask
 
 class SFTDataset(Dataset):
@@ -120,6 +120,11 @@ class SFTDataset(Dataset):
             role = 'user' if i % 2 == 0 else 'assistant'
             messages.append({"role": role, "content": turn['content']})
         # 使用分词器提供的模板方法构建对话提示
+        # print(self.tokenizer.apply_chat_template(
+        #     messages,
+        #     tokenize=False,
+        #     add_generation_prompt=False
+        # ))
         return self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -179,3 +184,19 @@ class SFTDataset(Dataset):
         loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)  # 对齐预测位置
 
         return X, Y, loss_mask
+
+
+
+# if __name__ == "__main__":
+#     from transformers import AutoTokenizer
+#     tokenizer = AutoTokenizer.from_pretrained("spongebob_tokenizer")
+#     dataset = SFTDataset("datasets/r1_1024.jsonl", tokenizer, max_length=1024)
+#     dataset.__getitem__(0)
+#     # dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+
+#     # for i, (X, Y, loss_mask) in enumerate(dataloader):
+#     #     print("X:", X)
+#     #     print("Y:", Y)
+#     #     print("loss_mask:", loss_mask)
+#     #     if i == 1:
+#     #         break
