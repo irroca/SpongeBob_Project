@@ -50,14 +50,13 @@ def main():
           prompt = input('👶: ')  # 手动输入对话内容
           messages = messages[-args.history_cnt:] if args.history_cnt else []
           messages.append({"role": "user", "content": prompt})
-          # print('messages:', messages)
           new_prompt = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True
           )[-args.max_seq_len + 1:] if args.model_mode != 0 else (tokenizer.bos_token + prompt)
-          print('new_prompt:', new_prompt)
-          
+          print(new_prompt)
+
           with torch.no_grad():
                x = torch.tensor(tokenizer(new_prompt)['input_ids'], device=args.device).unsqueeze(0)
                outputs = model.generate(
