@@ -30,6 +30,7 @@ spongebob-llm/
 ├── Config.py               # 模型配置类 (LLMConfig)
 ├── model.py                # 模型核心架构 (SpongeBob, Attention, RMSNorm etc.)
 ├── dataset.py              # 数据集加载器 (PretrainDataset, SFTDataset)
+├── train_tokenizer.py      # 训练tokenizer脚本
 ├── pretrain.py             # 预训练脚本（支持checkpoint恢复）
 ├── SFT.py                  # 有监督微调脚本（支持checkpoint恢复）
 ├── distill.py              # 知识蒸馏脚本（支持checkpoint恢复）
